@@ -1,12 +1,15 @@
-#include <arpa/inet.h>
 #include <errno.h>
 #include <ruby.h>
 #include <ruby/encoding.h>
 #include <ruby/io.h>
 #include <ruby/thread.h>
+
+#ifndef _WIN32
+#include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#endif
 
 #include <unistd.h>
 #include <fcntl.h>
@@ -454,8 +457,26 @@ static int _cb_ruby_wait(trilogy_sock_t *sock, trilogy_wait_t wait)
     args.timeout = timeout;
     args.rc = 0;
 
+#ifdef _WIN32
+    // Trilogy holds a Winsock SOCKET, but Ruby waits on C runtime file descriptors. Borrow a descriptor for the
+    // duration of the wait; unwrapping it afterwards releases the descriptor without closing the socket.
+    args.fd = rb_w32_wrap_io_handle((HANDLE)(intptr_t)args.fd, O_RDWR | O_BINARY);
+    if (args.fd < 0) {
+        return TRILOGY_SYSERR;
+    }
+#endif
+
     int state = 0;
     rb_protect(rb_trilogy_wait_protected, (VALUE)&args, &state);
+
+#ifdef _WIN32
+    {
+        int errno_was = errno;
+        rb_w32_unwrap_io_handle(args.fd);
+        errno = errno_was;
+    }
+#endif
+
     if (state) {
         struct trilogy_ctx *ctx = sock->opts.privdata;
         rb_trilogy_release_buffer(ctx);
@@ -472,6 +493,61 @@ static int _cb_ruby_wait(trilogy_sock_t *sock, trilogy_wait_t wait)
 
     return TRILOGY_OK;
 }
+
+#ifdef _WIN32
+// Ruby hands us a C runtime file descriptor wrapping the socket; Trilogy wants the Winsock SOCKET itself. Returns a
+// duplicate of the underlying SOCKET that Trilogy owns and closes with closesocket().
+static int dup_socket_fd(int fd)
+{
+    SOCKET sock = rb_w32_get_osfhandle(fd);
+    if (sock == INVALID_SOCKET) {
+        return -1;
+    }
+
+    WSAPROTOCOL_INFOW info;
+    if (WSADuplicateSocketW(sock, GetCurrentProcessId(), &info) != 0) {
+        return -1;
+    }
+
+    DWORD flags = WSA_FLAG_OVERLAPPED;
+#ifdef WSA_FLAG_NO_HANDLE_INHERIT
+    flags |= WSA_FLAG_NO_HANDLE_INHERIT;
+#endif
+
+    SOCKET newsock = WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, &info, 0, flags);
+    if (newsock == INVALID_SOCKET) {
+        return -1;
+    }
+
+    // Trilogy expects a non-blocking socket. Ruby emulates non-blocking mode on Windows rather than setting it on the
+    // socket itself. WSAIoctl rather than ioctlsocket: <ruby.h> redefines the latter to take a file descriptor.
+    u_long nonblocking = 1;
+    DWORD bytes_returned = 0;
+    if (WSAIoctl(newsock, FIONBIO, &nonblocking, sizeof(nonblocking), NULL, 0, &bytes_returned, NULL, NULL) != 0) {
+        closesocket(newsock);
+        return -1;
+    }
+
+    // Windows guarantees socket handle values fit in 32 bits, see trilogy/platform.h
+    return (int)newsock;
+}
+#else
+static int dup_socket_fd(int fd)
+{
+    int newfd = dup(fd);
+    if (newfd < 0) {
+        return -1;
+    }
+
+    int flags = fcntl(fd, F_GETFD); /* should not fail except EBADF. */
+    if (flags == -1 || fcntl(newfd, F_SETFD, flags) != 0) {
+        close(newfd);
+        return -1;
+    }
+
+    return newfd;
+}
+#endif
 
 static int try_connect(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake, const trilogy_sockopt_t *opts, int fd)
 {
@@ -490,19 +566,9 @@ static int try_connect(struct trilogy_ctx *ctx, trilogy_handshake_t *handshake, 
 escape the GVL on each wait operation without going through call_without_gvl */
     sock->wait_cb = _cb_ruby_wait;
 
-    int newfd = dup(fd);
+    int newfd = dup_socket_fd(fd);
     if (newfd < 0) {
-        return TRILOGY_ERR;
-    }
-
-    int flags = fcntl(fd, F_GETFD); /* should not fail except EBADF. */
-    if (flags == -1) {
-        close(newfd);
-        return TRILOGY_ERR;
-    }
-
-    if (fcntl(newfd, F_SETFD, flags) != 0){
-        close(newfd);
+        trilogy_sock_close(sock);
         return TRILOGY_ERR;
     }
 

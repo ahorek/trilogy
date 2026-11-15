@@ -1,5 +1,37 @@
 require File.expand_path("../lib/trilogy/version", __FILE__)
 
+# ext/trilogy-ruby/inc and ext/trilogy-ruby/src are symlinks to the C library at
+# the repository root. Git on Windows checks symlinks out as small text files
+# holding the link target unless core.symlinks is enabled, and the globs below
+# then find no C sources. Recreate any link that is missing or a placeholder.
+%w[inc src].each do |name|
+  link = File.expand_path("../ext/trilogy-ruby/#{name}", __FILE__)
+  next if File.directory?(link)
+
+  relative_target = "../../../../#{name}"
+  target = File.expand_path(relative_target, File.dirname(link))
+  next unless File.directory?(target) # not in a repository checkout
+
+  if File.file?(link)
+    # Only replace Git's placeholder, never a real file.
+    next unless File.read(link).strip == relative_target
+    File.delete(link)
+  end
+
+  begin
+    File.symlink(relative_target, link)
+  rescue NotImplementedError, SystemCallError
+    raise unless Gem.win_platform?
+
+    # Symlinks on Windows need Developer Mode or admin rights; a directory
+    # junction needs neither.
+    unless system("cmd", "/c", "mklink", "/J", link.tr("/", "\\"), target.tr("/", "\\"), out: File::NULL)
+      abort "trilogy.gemspec: could not link #{link} to #{target}. " \
+            "Enable Windows Developer Mode, or run `git config core.symlinks true` and check out again."
+    end
+  end
+end
+
 Gem::Specification.new do |s|
   s.name = "trilogy"
   s.version = Trilogy::VERSION
