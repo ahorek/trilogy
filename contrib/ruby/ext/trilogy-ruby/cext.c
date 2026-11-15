@@ -305,6 +305,10 @@ static void handle_trilogy_error(struct trilogy_ctx *ctx, int rc, const char *ms
         ERR_clear_error();
         if (ERR_GET_LIB(ossl_error) == ERR_LIB_SYS) {
             int err_reason = ERR_GET_REASON(ossl_error);
+#ifdef _WIN32
+            // OpenSSL records Winsock and Win32 error codes here rather than errno values.
+            err_reason = rb_w32_map_errno((DWORD)err_reason);
+#endif
             exc = trilogy_new_syserr_fail(err_reason, rbmsg);
         }
         else {
@@ -762,7 +766,10 @@ static VALUE rb_trilogy_connect(VALUE self, VALUE raw_socket, VALUE encoding, VA
     }
 
     if ((val = rb_hash_lookup(opts, ID2SYM(id_max_allowed_packet))) != Qnil) {
-        Check_Type(val, T_FIXNUM);
+        // Not Check_Type(val, T_FIXNUM): where long is 32 bits (Windows), a 1GB limit is not a Fixnum.
+        if (!RB_INTEGER_TYPE_P(val)) {
+            rb_raise(rb_eTypeError, "wrong argument type %" PRIsVALUE " (expected Integer)", rb_obj_class(val));
+        }
         connopt.max_allowed_packet = NUM2SIZET(val);
     }
 
