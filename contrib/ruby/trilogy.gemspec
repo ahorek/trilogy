@@ -3,7 +3,7 @@ require File.expand_path("../lib/trilogy/version", __FILE__)
 # ext/trilogy-ruby/inc and ext/trilogy-ruby/src are symlinks to the C library at
 # the repository root. Git on Windows checks symlinks out as small text files
 # holding the link target unless core.symlinks is enabled, and the globs below
-# then find no C sources. Recreate any link that is missing or a placeholder.
+# then find no C sources. Recreate any link that is not a working directory.
 %w[inc src].each do |name|
   link = File.expand_path("../ext/trilogy-ruby/#{name}", __FILE__)
   next if File.directory?(link)
@@ -12,10 +12,15 @@ require File.expand_path("../lib/trilogy/version", __FILE__)
   target = File.expand_path(relative_target, File.dirname(link))
   next unless File.directory?(target) # not in a repository checkout
 
-  if File.file?(link)
-    # Only replace Git's placeholder, never a real file.
-    next unless File.read(link).strip == relative_target
+  # Whatever is there is not a usable directory: Git's placeholder file, or a
+  # file-type symlink (Git on Windows creates those when the target does not
+  # exist yet at checkout), which cannot point at a directory. Replace it.
+  begin
     File.delete(link)
+  rescue Errno::ENOENT
+    # nothing to replace
+  rescue SystemCallError
+    Dir.rmdir(link) # dangling directory symlink or junction
   end
 
   begin
