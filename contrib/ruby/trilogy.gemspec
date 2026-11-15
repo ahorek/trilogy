@@ -23,18 +23,17 @@ require File.expand_path("../lib/trilogy/version", __FILE__)
     Dir.rmdir(link) # dangling directory symlink or junction
   end
 
-  begin
+  if Gem.win_platform?
+    # Ruby's File.symlink resolves a relative target against the current
+    # directory when deciding between a file and a directory link, so it would
+    # create a file-type link here that cannot be traversed. A directory
+    # junction always works and needs neither Developer Mode nor admin rights.
+    system("cmd", "/c", "mklink", "/J", link.tr("/", "\\"), target.tr("/", "\\"), out: File::NULL)
+  else
     File.symlink(relative_target, link)
-  rescue NotImplementedError, SystemCallError
-    raise unless Gem.win_platform?
-
-    # Symlinks on Windows need Developer Mode or admin rights; a directory
-    # junction needs neither.
-    unless system("cmd", "/c", "mklink", "/J", link.tr("/", "\\"), target.tr("/", "\\"), out: File::NULL)
-      abort "trilogy.gemspec: could not link #{link} to #{target}. " \
-            "Enable Windows Developer Mode, or run `git config core.symlinks true` and check out again."
-    end
   end
+
+  abort "trilogy.gemspec: could not link #{link} to #{target}." unless File.directory?(link)
 end
 
 Gem::Specification.new do |s|
